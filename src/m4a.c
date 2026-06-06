@@ -21,7 +21,10 @@ COMMON_DATA struct PokemonCrySong gPokemonCrySong = {0};
 COMMON_DATA u8 gMPlayMemAccArea[0x10] = {0};
 COMMON_DATA struct MusicPlayerInfo gMPlayInfo_SE3 = {0};
 
-#if WASM
+// The WASM port now builds the real m4a engine below; the functions that exist
+// only as ARM assembly in m4a_1.s (SoundMain, MPlayMain, ply_*, ...) are
+// reimplemented in C in src/m4a_wasm.c. The old all-stub WASM path is disabled.
+#if 0
 static void WasmMPlayStart(struct MusicPlayerInfo *mplayInfo)
 {
     if (mplayInfo == NULL)
@@ -132,7 +135,11 @@ void m4aSoundInit(void)
 {
     s32 i;
 
+#if !WASM
+    // Copies the ARM mixer (SoundMainRAM) into IWRAM for speed. The wasm port's
+    // mixer is plain C in m4a_wasm.c, so there is no such code blob to relocate.
     CpuCopy32((void *)((s32)SoundMainRAM & ~1), SoundMainRAM_Buffer, sizeof(SoundMainRAM_Buffer));
+#endif
 
     SoundInit(&gSoundInfo);
     MPlayExtender(gCgbChans);
@@ -386,10 +393,12 @@ void MPlayExtender(struct CgbChannel *cgbChans)
     soundInfo->ident = ident;
 }
 
+#if !WASM
 static void UNUSED MusicPlayerJumpTableCopy(void)
 {
     asm("swi 0x2A");
 }
+#endif
 
 void ClearChain(void *x)
 {
@@ -677,6 +686,14 @@ void MPlayStart(struct MusicPlayerInfo *mplayInfo, struct SongHeader *songHeader
 
     if (mplayInfo->ident != ID_NUMBER)
         return;
+
+#if WASM
+    // The wasm build may link only a subset of songs; gSongTable entries for
+    // songs that were not built resolve to a NULL header. Ignore those rather
+    // than dereferencing address 0.
+    if (songHeader == NULL)
+        return;
+#endif
 
     unk_B = mplayInfo->unk_B;
 

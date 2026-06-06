@@ -35,7 +35,12 @@ def run_gbagfx(input_path, output_path, options=()):
 def ensure_make_target(target):
     if pathlib.Path(target).exists():
         return
-    subprocess.run(['make', 'NODEP=1', 'SETUP_PREREQS=1', target], check=True)
+    # SETUP_PREREQS=0: tools and generated sources are already built (the wasm
+    # target depends on `generated` before wasm-assets), so skip the prereq
+    # scan block. Passing SETUP_PREREQS=1 here makes the command-line override
+    # propagate into the recursive `$(MAKE) generated` and defeat the
+    # RULES_NO_SCAN guard, causing unbounded make/shell recursion.
+    subprocess.run(['make', 'NODEP=1', 'SETUP_PREREQS=0', target], check=True)
 
 
 def generate_incgfx(source, extension, args):

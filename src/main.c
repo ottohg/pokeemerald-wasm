@@ -103,6 +103,7 @@ void AgbMain(void)
     InitIntrHandlers();
 #if WASM
     gFlashMemoryPresent = TRUE;
+    m4aSoundInit();
 #else
     m4aSoundInit();
     EnableVCountIntrAtLine150();

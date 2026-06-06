@@ -1,0 +1,967 @@
+// WebAssembly C reimplementation of the m4a functions that exist only as ARM
+// assembly in src/m4a_1.s (which cannot be built for wasm32). This covers the
+// MIDI sequencer (MPlayMain, ply_note and the ply_* command handlers) and the
+// DirectSound software mixer (SoundMain/SoundMainRAM). The rest of the m4a
+// engine (src/m4a.c) is ordinary C and is compiled for wasm directly.
+//
+// The port is faithful to the original engine's data structures and behaviour;
+// it only departs from the assembly where the GBA hardware model does not apply
+// (no real-time scanline budget, no Direct Sound DMA double buffering - the JS
+// frontend reads the freshly mixed PCM out of SoundInfo.pcmBuffer each frame).
+
+#include "global.h"
+#include "gba/m4a_internal.h"
+
+#if WASM
+
+// Constants that live in constants/m4a_constants.inc on the GBA asm side.
+#define TONEDATA_TYPE_REV         0x10
+#define TONEDATA_TYPE_CMP         0x20
+#define SOUND_CHANNEL_SF_SPECIAL  0x20
+#define WAVE_DATA_FLAG_LOOP       0xC0
+
+extern const u8 gClockTable[];
+extern u32 MidiKeyToFreq(struct WaveData *wav, u8 key, u8 fineAdjust);
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+u32 umul3232H32(u32 multiplier, u32 multiplicand)
+{
+    return (u32)(((u64)multiplier * (u64)multiplicand) >> 32);
+}
+
+static inline u8 TrackReadByte(struct MusicPlayerTrack *track)
+{
+    return *track->cmdPtr++;
+}
+
+void RealClearChain(void *x)
+{
+    struct SoundChannel *chan = x;
+    struct MusicPlayerTrack *track = chan->track;
+
+    if (track == NULL)
+        return;
+
+    struct SoundChannel *next = chan->nextChannelPointer;
+    struct SoundChannel *prev = chan->prevChannelPointer;
+
+    if (prev != NULL)
+        prev->nextChannelPointer = next;
+    else
+        track->chan = next;
+
+    if (next != NULL)
+        next->prevChannelPointer = prev;
+
+    chan->track = NULL;
+}
+
+// Clear64byte's jump-table target (BIOS SoundMainBTM): zero 64 bytes.
+static void Clear64(void *x)
+{
+    u32 *p = x;
+    for (s32 i = 0; i < 16; i++)
+        p[i] = 0;
+}
+
+static void ClearModMod(struct MusicPlayerTrack *track)
+{
+    track->modM = 0;
+    track->lfoSpeedC = 0;
+    if (track->modT == 0)
+        track->flags |= MPT_FLG_PITCHG;
+    else
+        track->flags |= MPT_FLG_VOLCHG;
+}
+
+// ---------------------------------------------------------------------------
+// Track command handlers (ply_*)
+// ---------------------------------------------------------------------------
+
+void ply_fine(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    struct SoundChannel *chan = track->chan;
+    while (chan != NULL)
+    {
+        if (chan->statusFlags & SOUND_CHANNEL_SF_ON)
+            chan->statusFlags |= SOUND_CHANNEL_SF_STOP;
+        struct SoundChannel *next = chan->nextChannelPointer;
+        RealClearChain(chan);
+        chan = next;
+    }
+    track->flags = 0;
+}
+
+void ply_goto(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    u8 *base = track->cmdPtr;
+    u32 addr = base[0] | (base[1] << 8) | (base[2] << 16) | (base[3] << 24);
+    track->cmdPtr = (u8 *)addr;
+}
+
+void ply_patt(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    u8 level = track->patternLevel;
+    if (level >= 3)
+    {
+        ply_fine(mplayInfo, track);
+        return;
+    }
+    track->patternStack[level] = track->cmdPtr + 4;
+    track->patternLevel = level + 1;
+    ply_goto(mplayInfo, track);
+}
+
+void ply_pend(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    if (track->patternLevel != 0)
+    {
+        u8 level = track->patternLevel - 1;
+        track->patternLevel = level;
+        track->cmdPtr = track->patternStack[level];
+    }
+}
+
+void ply_rept(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    if (track->cmdPtr[0] == 0)
+    {
+        track->cmdPtr += 1;
+        ply_goto(mplayInfo, track);
+        return;
+    }
+    if (++track->repN < track->cmdPtr[0])
+    {
+        track->cmdPtr += 1;
+        ply_goto(mplayInfo, track);
+        return;
+    }
+    track->repN = 0;
+    track->cmdPtr += 5;
+}
+
+void ply_prio(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    track->priority = TrackReadByte(track);
+}
+
+void ply_tempo(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    u16 bpm = TrackReadByte(track) << 1;
+    mplayInfo->tempoD = bpm;
+    mplayInfo->tempoI = (bpm * mplayInfo->tempoU) >> 8;
+}
+
+void ply_keysh(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    track->keyShift = TrackReadByte(track);
+    track->flags |= MPT_FLG_PITCHG | MPT_FLG_PITSET;
+}
+
+void ply_voice(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    u8 voice = TrackReadByte(track);
+    const struct ToneData *tone = &mplayInfo->tone[voice];
+    track->tone = *tone;
+}
+
+void ply_vol(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    track->vol = TrackReadByte(track);
+    track->flags |= MPT_FLG_VOLCHG;
+}
+
+void ply_pan(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    track->pan = (s8)(TrackReadByte(track) - C_V);
+    track->flags |= MPT_FLG_VOLCHG;
+}
+
+void ply_bend(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    track->bend = (s8)(TrackReadByte(track) - C_V);
+    track->flags |= MPT_FLG_PITCHG;
+}
+
+void ply_bendr(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    track->bendRange = TrackReadByte(track);
+    track->flags |= MPT_FLG_PITCHG;
+}
+
+void ply_lfodl(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    track->lfoDelay = TrackReadByte(track);
+}
+
+void ply_modt(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    u8 type = TrackReadByte(track);
+    if (track->modT != type)
+    {
+        track->modT = type;
+        track->flags |= MPT_FLG_VOLCHG | MPT_FLG_PITCHG;
+    }
+}
+
+void ply_tune(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    track->tune = (s8)(TrackReadByte(track) - C_V);
+    track->flags |= MPT_FLG_PITCHG;
+}
+
+void ply_port(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    // Portamento drives the CGB sweep registers on hardware; consume both bytes
+    // and leave PSG output to the (currently silent) CGB path.
+    TrackReadByte(track);
+    TrackReadByte(track);
+}
+
+void ply_lfos(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    track->lfoSpeed = TrackReadByte(track);
+    if (track->lfoSpeed == 0)
+        ClearModMod(track);
+}
+
+void ply_mod(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    track->mod = TrackReadByte(track);
+    if (track->mod == 0)
+        ClearModMod(track);
+}
+
+void ply_endtie(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    u8 key = track->cmdPtr[0];
+    if (key < 0x80)
+    {
+        track->key = key;
+        track->cmdPtr += 1;
+    }
+    else
+    {
+        key = track->key;
+    }
+
+    struct SoundChannel *chan = track->chan;
+    while (chan != NULL)
+    {
+        if ((chan->statusFlags & (SOUND_CHANNEL_SF_START | SOUND_CHANNEL_SF_ENV))
+            && !(chan->statusFlags & SOUND_CHANNEL_SF_STOP)
+            && chan->midiKey == key)
+        {
+            chan->statusFlags |= SOUND_CHANNEL_SF_STOP;
+            return;
+        }
+        chan = chan->nextChannelPointer;
+    }
+}
+
+static void ChnVolSetAsm(struct SoundChannel *chan, struct MusicPlayerTrack *track)
+{
+    s32 vel = chan->velocity;
+    s32 pan = (s8)chan->rhythmPan;
+
+    s32 right = (track->volMR * ((0x80 + pan) * vel)) >> 14;
+    chan->rightVolume = (right > 0xFF) ? 0xFF : right;
+
+    s32 left = (track->volML * ((0x7F - pan) * vel)) >> 14;
+    chan->leftVolume = (left > 0xFF) ? 0xFF : left;
+}
+
+// ---------------------------------------------------------------------------
+// ply_note: allocate a Direct Sound (or CGB) channel and start a note.
+// ---------------------------------------------------------------------------
+
+void ply_note(u32 noteCmd, struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    struct SoundInfo *soundInfo = SOUND_INFO_PTR;
+
+    track->gateTime = gClockTable[noteCmd];
+
+    // Read key / velocity / optional gate-time extension from the stream.
+    if (track->cmdPtr[0] < 0x80)
+    {
+        track->key = track->cmdPtr[0];
+        track->cmdPtr++;
+        if (track->cmdPtr[0] < 0x80)
+        {
+            track->velocity = track->cmdPtr[0];
+            track->cmdPtr++;
+            if (track->cmdPtr[0] < 0x80)
+            {
+                track->gateTime += track->cmdPtr[0];
+                track->cmdPtr++;
+            }
+        }
+    }
+
+    s32 rhythmPan = 0;
+    struct ToneData *tone = &track->tone;
+    const struct ToneData *toneFinal = tone;
+
+    if (tone->type & (TONEDATA_TYPE_RHY | TONEDATA_TYPE_SPL))
+    {
+        u8 key = track->key;
+        u32 index;
+        if (tone->type & TONEDATA_TYPE_SPL)
+        {
+            // Key-split table pointer is stored in the ToneData attack slot
+            // (offset 8); it maps each MIDI key to a sub-voice index.
+            u8 *keysplit = *(u8 **)&tone->attack;
+            index = keysplit[key];
+        }
+        else
+        {
+            index = key;
+        }
+        // The split/rhythm sub-voice table is pointed to by tone->wav.
+        struct ToneData *sub = &((struct ToneData *)tone->wav)[index];
+        toneFinal = sub;
+        if (sub->type & (TONEDATA_TYPE_SPL | TONEDATA_TYPE_RHY))
+            return; // nested split is invalid
+        if (tone->type & TONEDATA_TYPE_RHY)
+        {
+            u8 ps = sub->pan_sweep;
+            if (ps & 0x80)
+                rhythmPan = (s32)((ps - TONEDATA_P_S_PAN) << 1);
+        }
+    }
+
+    s32 keyForFreq = (tone->type & (TONEDATA_TYPE_RHY | TONEDATA_TYPE_SPL))
+                         ? toneFinal->key
+                         : track->key;
+
+    s32 priority = mplayInfo->priority + track->priority;
+    if (priority > 0xFF)
+        priority = 0xFF;
+
+    u32 cgbType = toneFinal->type & TONEDATA_TYPE_CGB;
+
+    struct SoundChannel *chan = NULL;
+
+    if (cgbType != 0)
+    {
+        struct CgbChannel *cgb = soundInfo->cgbChans;
+        if (cgb == NULL)
+            return;
+        cgb += cgbType - 1;
+        if ((cgb->statusFlags & SOUND_CHANNEL_SF_ON)
+            && !(cgb->statusFlags & SOUND_CHANNEL_SF_STOP))
+        {
+            if (cgb->priority > priority)
+                return;
+            if (cgb->priority == priority && (struct MusicPlayerTrack *)cgb->track < track)
+                return;
+        }
+        chan = (struct SoundChannel *)cgb;
+    }
+    else
+    {
+        // Direct Sound: pick a free channel, else steal the lowest-priority one.
+        s32 maxChans = soundInfo->maxChans;
+        struct SoundChannel *chans = soundInfo->chans;
+        s32 bestPriority = priority;
+        struct MusicPlayerTrack *bestTrack = track;
+        s32 stopFound = 0;
+        for (s32 i = 0; i < maxChans; i++)
+        {
+            struct SoundChannel *c = &chans[i];
+            if (!(c->statusFlags & SOUND_CHANNEL_SF_ON))
+            {
+                chan = c;
+                break;
+            }
+            if (c->statusFlags & SOUND_CHANNEL_SF_STOP)
+            {
+                if (!stopFound)
+                {
+                    stopFound = 1;
+                    bestPriority = c->priority;
+                    bestTrack = c->track;
+                    chan = c;
+                }
+                continue;
+            }
+            if (stopFound)
+                continue;
+            if (c->priority < bestPriority)
+            {
+                bestPriority = c->priority;
+                bestTrack = c->track;
+                chan = c;
+            }
+            else if (c->priority == bestPriority && c->track > bestTrack)
+            {
+                bestTrack = c->track;
+                chan = c;
+            }
+        }
+        if (chan == NULL)
+            return;
+    }
+
+    RealClearChain(chan);
+    chan->prevChannelPointer = NULL;
+    chan->nextChannelPointer = track->chan;
+    if (track->chan != NULL)
+        track->chan->prevChannelPointer = chan;
+    track->chan = chan;
+    chan->track = track;
+
+    track->lfoDelayC = track->lfoDelay;
+    if (track->lfoDelay != 0)
+        ClearModMod(track);
+
+    TrkVolPitSet(mplayInfo, track);
+
+    chan->gateTime = track->gateTime;
+    chan->priority = priority;
+    chan->key = keyForFreq;
+    chan->rhythmPan = rhythmPan;
+    chan->type = toneFinal->type;
+    chan->wav = toneFinal->wav;
+    chan->attack = toneFinal->attack;
+    chan->decay = toneFinal->decay;
+    chan->sustain = toneFinal->sustain;
+    chan->release = toneFinal->release;
+    chan->pseudoEchoVolume = track->pseudoEchoVolume;
+    chan->pseudoEchoLength = track->pseudoEchoLength;
+
+    ChnVolSetAsm(chan, track);
+
+    s32 midiKey = chan->key + track->keyM;
+    if (midiKey < 0)
+        midiKey = 0;
+
+    if (cgbType != 0)
+    {
+        // CGB channels are not synthesised yet; mark the slot started so the
+        // sequencer state stays consistent, but it stays silent.
+        chan->count = 0;
+        chan->frequency = 0;
+    }
+    else
+    {
+        chan->count = track->unk_3C;
+        chan->frequency = MidiKeyToFreq(chan->wav, midiKey, track->pitM);
+    }
+
+    chan->statusFlags = SOUND_CHANNEL_SF_START;
+    track->flags &= 0xF0;
+}
+
+// ---------------------------------------------------------------------------
+// Jump table + TrackStop
+// ---------------------------------------------------------------------------
+
+void TrackStop(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
+{
+    if (!(track->flags & MPT_FLG_EXIST))
+        return;
+
+    struct SoundChannel *chan = track->chan;
+    while (chan != NULL)
+    {
+        if (chan->statusFlags != 0)
+        {
+            if (chan->type & TONEDATA_TYPE_CGB)
+            {
+                struct SoundInfo *soundInfo = SOUND_INFO_PTR;
+                soundInfo->CgbOscOff(((struct CgbChannel *)chan)->type);
+            }
+            chan->statusFlags = 0;
+        }
+        chan->track = NULL;
+        chan = chan->nextChannelPointer;
+    }
+    track->chan = NULL;
+}
+
+void MPlayJumpTableCopy(MPlayFunc *t)
+{
+    for (s32 i = 0; i < 36; i++)
+        t[i] = (MPlayFunc)ply_fine;
+
+    t[0]  = (MPlayFunc)ply_fine;
+    t[1]  = (MPlayFunc)ply_goto;
+    t[2]  = (MPlayFunc)ply_patt;
+    t[3]  = (MPlayFunc)ply_pend;
+    t[4]  = (MPlayFunc)ply_rept;
+    t[8]  = (MPlayFunc)ply_memacc;
+    t[9]  = (MPlayFunc)ply_prio;
+    t[10] = (MPlayFunc)ply_tempo;
+    t[11] = (MPlayFunc)ply_keysh;
+    t[12] = (MPlayFunc)ply_voice;
+    t[13] = (MPlayFunc)ply_vol;
+    t[14] = (MPlayFunc)ply_pan;
+    t[15] = (MPlayFunc)ply_bend;
+    t[16] = (MPlayFunc)ply_bendr;
+    t[17] = (MPlayFunc)ply_lfos;
+    t[18] = (MPlayFunc)ply_lfodl;
+    t[19] = (MPlayFunc)ply_mod;
+    t[20] = (MPlayFunc)ply_modt;
+    t[23] = (MPlayFunc)ply_tune;
+    t[27] = (MPlayFunc)ply_port;
+    t[28] = (MPlayFunc)ply_xcmd;
+    t[29] = (MPlayFunc)ply_endtie;
+    t[30] = (MPlayFunc)SampleFreqSet;
+    t[31] = (MPlayFunc)TrackStop;
+    t[32] = (MPlayFunc)FadeOutBody;
+    t[33] = (MPlayFunc)TrkVolPitSet;
+    t[34] = (MPlayFunc)RealClearChain;
+    t[35] = (MPlayFunc)Clear64;
+}
+
+// ---------------------------------------------------------------------------
+// MPlayMain: advance one music player by the elapsed tempo ticks.
+// ---------------------------------------------------------------------------
+
+void MPlayMain(struct MusicPlayerInfo *mplayInfo)
+{
+    struct SoundInfo *soundInfo = SOUND_INFO_PTR;
+
+    if (mplayInfo->ident != ID_NUMBER)
+        return;
+    mplayInfo->ident++;
+
+    if ((s32)mplayInfo->status < 0)
+    {
+        FadeOutBody(mplayInfo);
+        if ((s32)mplayInfo->status < 0)
+        {
+            mplayInfo->ident = ID_NUMBER;
+            return;
+        }
+    }
+
+    mplayInfo->tempoC += mplayInfo->tempoI;
+
+    while (mplayInfo->tempoC >= 150)
+    {
+        mplayInfo->tempoC -= 150;
+
+        u32 trackBits = 0;
+        u32 trackCount = mplayInfo->trackCount;
+        struct MusicPlayerTrack *track = mplayInfo->tracks;
+
+        for (u32 i = 0; i < trackCount; i++, track++)
+        {
+            if (!(track->flags & MPT_FLG_EXIST))
+                continue;
+
+            trackBits |= (1u << i);
+
+            // Tick channel gate timers; stop channels whose gate expired and
+            // unlink channels that already turned off.
+            struct SoundChannel *chan = track->chan;
+            while (chan != NULL)
+            {
+                struct SoundChannel *next = chan->nextChannelPointer;
+                if (chan->statusFlags & SOUND_CHANNEL_SF_ON)
+                {
+                    if (chan->gateTime != 0 && --chan->gateTime == 0)
+                        chan->statusFlags |= SOUND_CHANNEL_SF_STOP;
+                }
+                else
+                {
+                    RealClearChain(chan);
+                }
+                chan = next;
+            }
+
+            if (track->flags & MPT_FLG_START)
+            {
+                Clear64(track);
+                track->flags = MPT_FLG_EXIST;
+                track->bendRange = 2;
+                track->volX = 0x40;
+                track->lfoSpeed = 0x16;
+                track->tone.type = 1;
+            }
+
+            // Run commands until a wait is queued.
+            while (track->wait == 0)
+            {
+                u8 cmd = track->cmdPtr[0];
+                if (cmd < 0x80)
+                {
+                    cmd = track->runningStatus;
+                }
+                else
+                {
+                    track->cmdPtr++;
+                    if (cmd >= 0xBD)
+                        track->runningStatus = cmd;
+                }
+
+                if (cmd >= 0xCF)
+                {
+                    ply_note(cmd - 0xCF, mplayInfo, track);
+                }
+                else if (cmd >= 0xB1)
+                {
+                    mplayInfo->cmd = cmd - 0xB1;
+                    MPlayFunc fn = soundInfo->MPlayJumpTable[cmd - 0xB1];
+                    ((void (*)(struct MusicPlayerInfo *, struct MusicPlayerTrack *))fn)(mplayInfo, track);
+                    if (track->flags == 0)
+                        break; // track ended (ply_fine)
+                }
+                else
+                {
+                    track->wait = gClockTable[cmd - 0x80];
+                }
+            }
+
+            if (track->flags == 0)
+                continue;
+
+            if (track->wait != 0)
+                track->wait--;
+
+            // LFO / modulation update.
+            if (track->lfoSpeed != 0 && track->mod != 0)
+            {
+                if (track->lfoDelayC != 0)
+                {
+                    track->lfoDelayC--;
+                }
+                else
+                {
+                    track->lfoSpeedC += track->lfoSpeed;
+                    s32 r;
+                    u8 c = track->lfoSpeedC;
+                    if ((s8)(c - 0x40) >= 0)
+                        r = (s8)(0x80 - c);
+                    else
+                        r = (s8)c;
+                    s32 m = (track->mod * r) >> 6;
+                    if ((u8)(track->modM ^ m) != 0)
+                    {
+                        track->modM = m;
+                        if (track->modT == 0)
+                            track->flags |= MPT_FLG_PITCHG;
+                        else
+                            track->flags |= MPT_FLG_VOLCHG;
+                    }
+                }
+            }
+        }
+
+        mplayInfo->clock++;
+
+        if (trackBits == 0)
+        {
+            mplayInfo->status = MUSICPLAYER_STATUS_PAUSE;
+            mplayInfo->ident = ID_NUMBER;
+            return;
+        }
+        mplayInfo->status = trackBits;
+    }
+
+    // Apply queued volume/pitch changes to live channels.
+    u32 trackCount = mplayInfo->trackCount;
+    struct MusicPlayerTrack *track = mplayInfo->tracks;
+    for (u32 i = 0; i < trackCount; i++, track++)
+    {
+        if (!(track->flags & MPT_FLG_EXIST))
+            continue;
+        if (!(track->flags & (MPT_FLG_VOLCHG | MPT_FLG_PITCHG)))
+            continue;
+
+        TrkVolPitSet(mplayInfo, track);
+
+        struct SoundChannel *chan = track->chan;
+        while (chan != NULL)
+        {
+            struct SoundChannel *next = chan->nextChannelPointer;
+            if (!(chan->statusFlags & SOUND_CHANNEL_SF_ON))
+            {
+                RealClearChain(chan);
+            }
+            else
+            {
+                u32 cgbType = chan->type & TONEDATA_TYPE_CGB;
+                if (track->flags & MPT_FLG_VOLCHG)
+                    ChnVolSetAsm(chan, track);
+                if (track->flags & MPT_FLG_PITCHG)
+                {
+                    s32 midiKey = chan->key + track->keyM;
+                    if (midiKey < 0)
+                        midiKey = 0;
+                    if (cgbType == 0)
+                        chan->frequency = MidiKeyToFreq(chan->wav, midiKey, track->pitM);
+                }
+            }
+            chan = next;
+        }
+        track->flags &= 0xF0;
+    }
+
+    mplayInfo->ident = ID_NUMBER;
+}
+
+// ---------------------------------------------------------------------------
+// SoundMainRAM: the Direct Sound software mixer.
+// ---------------------------------------------------------------------------
+
+#define MIX_MAX_SAMPLES PCM_DMA_BUF_SIZE
+
+static s32 sMixL[MIX_MAX_SAMPLES];
+static s32 sMixR[MIX_MAX_SAMPLES];
+
+static inline s8 ClampS8(s32 v)
+{
+    if (v > 127) return 127;
+    if (v < -128) return -128;
+    return (s8)v;
+}
+
+static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
+{
+    s32 numSamples = soundInfo->pcmSamplesPerVBlank;
+    if (numSamples > MIX_MAX_SAMPLES)
+        numSamples = MIX_MAX_SAMPLES;
+
+    for (s32 i = 0; i < numSamples; i++)
+    {
+        sMixL[i] = 0;
+        sMixR[i] = 0;
+    }
+
+    u32 divFreq = soundInfo->divFreq;
+    s32 maxChans = soundInfo->maxChans;
+
+    for (s32 ci = 0; ci < maxChans; ci++)
+    {
+        struct SoundChannel *chan = &soundInfo->chans[ci];
+        u8 flags = chan->statusFlags;
+        if (!(flags & SOUND_CHANNEL_SF_ON))
+            continue;
+
+        struct WaveData *wav = chan->wav;
+
+        // --- envelope / lifecycle state machine -----------------------------
+        u8 env;
+        if (flags & SOUND_CHANNEL_SF_START)
+        {
+            if (flags & SOUND_CHANNEL_SF_STOP)
+            {
+                chan->statusFlags = 0;
+                continue;
+            }
+            flags = SOUND_CHANNEL_SF_ENV_ATTACK;
+            chan->currentPointer = wav->data + chan->count;
+            chan->count = wav->size - chan->count;
+            env = 0;
+            chan->fw = 0;
+            if (((u8 *)&wav->type)[1] & WAVE_DATA_FLAG_LOOP)
+                flags |= SOUND_CHANNEL_SF_LOOP;
+            chan->statusFlags = flags;
+        }
+        else
+        {
+            env = chan->envelopeVolume;
+            if (flags & SOUND_CHANNEL_SF_IEC)
+            {
+                if (--chan->pseudoEchoLength == 0)
+                {
+                    chan->statusFlags = 0;
+                    continue;
+                }
+                // keep current env
+            }
+            else if (flags & SOUND_CHANNEL_SF_STOP)
+            {
+                env = (env * chan->release) >> 8;
+                if (env <= chan->pseudoEchoVolume)
+                {
+                    if (chan->pseudoEchoVolume == 0)
+                    {
+                        chan->statusFlags = 0;
+                        continue;
+                    }
+                    env = chan->pseudoEchoVolume;
+                    flags |= SOUND_CHANNEL_SF_IEC;
+                    chan->statusFlags = flags;
+                }
+            }
+            else
+            {
+                u8 envState = flags & SOUND_CHANNEL_SF_ENV;
+                if (envState == SOUND_CHANNEL_SF_ENV_DECAY)
+                {
+                    env = (env * chan->decay) >> 8;
+                    if (env <= chan->sustain)
+                    {
+                        env = chan->sustain;
+                        if (env == 0 && chan->pseudoEchoVolume == 0)
+                        {
+                            chan->statusFlags = 0;
+                            continue;
+                        }
+                        if (env == 0)
+                        {
+                            env = chan->pseudoEchoVolume;
+                            flags |= SOUND_CHANNEL_SF_IEC;
+                            chan->statusFlags = flags;
+                        }
+                        else
+                        {
+                            chan->statusFlags = flags - 1; // -> SUSTAIN
+                        }
+                    }
+                }
+                else if (envState == SOUND_CHANNEL_SF_ENV_ATTACK)
+                {
+                    s32 a = env + chan->attack;
+                    if (a >= 0xFF)
+                    {
+                        a = 0xFF;
+                        chan->statusFlags = flags - 1; // -> DECAY
+                    }
+                    env = a;
+                }
+            }
+        }
+
+        chan->envelopeVolume = env;
+
+        s32 masterScaled = ((soundInfo->masterVolume + 1) * env) >> 4;
+        chan->envelopeVolumeRight = (chan->rightVolume * masterScaled) >> 8;
+        chan->envelopeVolumeLeft = (chan->leftVolume * masterScaled) >> 8;
+
+        flags = chan->statusFlags;
+
+        // --- mixing ---------------------------------------------------------
+        if (chan->type & (TONEDATA_TYPE_CMP | TONEDATA_TYPE_REV))
+        {
+            // Compressed / reversed samples are not decoded yet; advance nothing.
+            continue;
+        }
+
+        s32 envR = chan->envelopeVolumeRight;
+        s32 envL = chan->envelopeVolumeLeft;
+        s8 *ptr = chan->currentPointer;
+        s32 count = chan->count;
+
+        s32 loopFlag = flags & SOUND_CHANNEL_SF_LOOP;
+        s8 *loopPtr = wav->data + wav->loopStart;
+        s32 loopLen = wav->size - wav->loopStart;
+
+        if (chan->type & TONEDATA_TYPE_FIX)
+        {
+            // No resampling: one source sample per output sample.
+            for (s32 i = 0; i < numSamples; i++)
+            {
+                if (count <= 0)
+                {
+                    if (loopFlag)
+                    {
+                        ptr = loopPtr;
+                        count = loopLen;
+                    }
+                    else
+                    {
+                        chan->statusFlags = 0;
+                        break;
+                    }
+                }
+                s32 s = *ptr++;
+                count--;
+                sMixL[i] += (s * envL) >> 8;
+                sMixR[i] += (s * envR) >> 8;
+            }
+        }
+        else
+        {
+            u32 fw = chan->fw;
+            u32 inc = divFreq * chan->frequency; // .23 fixed-point phase step
+            s32 stopped = 0;
+            for (s32 i = 0; i < numSamples; i++)
+            {
+                if (count <= 0)
+                {
+                    if (loopFlag)
+                    {
+                        ptr = loopPtr;
+                        count += loopLen;
+                        if (count <= 0)
+                        {
+                            stopped = 1;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        stopped = 1;
+                        break;
+                    }
+                }
+                s32 s0 = ptr[0];
+                s32 s1 = (count > 1) ? ptr[1] : (loopFlag ? loopPtr[0] : s0);
+                s32 interp = s0 + (((s32)(fw) * (s1 - s0)) >> 23);
+                sMixL[i] += (interp * envL) >> 8;
+                sMixR[i] += (interp * envR) >> 8;
+
+                fw += inc;
+                u32 step = fw >> 23;
+                if (step != 0)
+                {
+                    fw &= 0x7FFFFF;
+                    ptr += step;
+                    count -= step;
+                }
+            }
+            chan->fw = fw;
+            if (stopped)
+                chan->statusFlags = 0;
+        }
+
+        chan->count = count;
+        chan->currentPointer = ptr;
+    }
+
+    // Write the mixed frame as signed 8-bit PCM: left then right halves.
+    s8 *pcm = soundInfo->pcmBuffer;
+    for (s32 i = 0; i < numSamples; i++)
+    {
+        pcm[i] = ClampS8(sMixL[i]);
+        pcm[PCM_DMA_BUF_SIZE + i] = ClampS8(sMixR[i]);
+    }
+}
+
+void SoundMain(void)
+{
+    struct SoundInfo *soundInfo = SOUND_INFO_PTR;
+    if (soundInfo->ident != ID_NUMBER)
+        return;
+    soundInfo->ident++;
+
+    if (soundInfo->MPlayMainHead != NULL)
+    {
+        struct MusicPlayerInfo *mp = soundInfo->musicPlayerHead;
+        MPlayMainFunc fn = soundInfo->MPlayMainHead;
+        while (fn != NULL && mp != NULL)
+        {
+            fn(mp);
+            fn = mp->MPlayMainNext;
+            mp = mp->musicPlayerNext;
+        }
+    }
+
+    soundInfo->CgbSound();
+    WasmSoundMainRAM(soundInfo);
+
+    soundInfo->ident = ID_NUMBER;
+}
+
+// No hardware V-blank/DMA in the browser; the JS frontend pulls PCM directly.
+void m4aSoundVSync(void) {}
+
+#endif // WASM

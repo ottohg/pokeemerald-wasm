@@ -220,6 +220,24 @@ WASM_DATA_ASM_SRCS := \
 	$(DATA_ASM_SUBDIR)/battle_anim_scripts.s
 WASM_DATA_OBJS := $(patsubst $(DATA_ASM_SUBDIR)/%.s,$(WASM_OBJ_DIR)/%.o,$(WASM_DATA_ASM_SRCS))
 
+# --- WASM audio ---
+# Songs (m4a sequences) to link into the wasm build. Defaults to a small slice
+# for fast iteration; set WASM_SONG_NAMES=all to build every song in midi.cfg.
+WASM_SONG_NAMES ?= mus_dummy mus_intro mus_title mus_littleroot mus_route101 \
+	mus_obtain_item mus_level_up
+ifeq ($(WASM_SONG_NAMES),all)
+WASM_SONG_NAMES := $(basename $(notdir $(MID_SRCS)))
+endif
+WASM_SONG_OBJS := $(patsubst %,$(WASM_OBJ_DIR)/songs/%.o,$(WASM_SONG_NAMES))
+
+# Sample blobs that data/sound_data.s incbins (built by audio_rules.mk).
+WASM_SAMPLE_BINS := \
+	$(patsubst %.wav,%.bin,$(wildcard sound/direct_sound_samples/*.wav)) \
+	$(patsubst %.wav,%.bin,$(wildcard sound/direct_sound_samples/cries/*.wav)) \
+	$(patsubst %.wav,%.bin,$(wildcard sound/direct_sound_samples/phonemes/*.wav))
+
+WASM_SOUND_OBJS := $(WASM_OBJ_DIR)/sound_data.o $(WASM_SONG_OBJS)
+
 C_ASM_SRCS := $(wildcard $(C_SUBDIR)/*.s $(C_SUBDIR)/*/*.s $(C_SUBDIR)/*/*/*.s)
 C_ASM_OBJS := $(patsubst $(C_SUBDIR)/%.s,$(C_BUILDDIR)/%.o,$(C_ASM_SRCS))
 
@@ -255,9 +273,21 @@ wasm-assets: $(GFX)
 
 $(WASM_C_OBJS): | generated wasm-assets
 
-$(WASM): Makefile $(WASM_C_OBJS) $(WASM_DATA_OBJS)
+$(WASM): Makefile $(WASM_C_OBJS) $(WASM_DATA_OBJS) $(WASM_SOUND_OBJS)
 	@test -n "$(WASM_LD)" || { echo "wasm-ld not found; set WASM_LD=/path/to/wasm-ld"; exit 1; }
 	$(WASM_LD) --no-entry --allow-undefined --initial-memory=268435456 --max-memory=268435456 --export=AgbMain --export=WasmRunFrame --export-all -o $@ $(filter %.o,$^)
+
+# m4a sound tables / voicegroups / samples (data/sound_data.s) -> wasm object.
+$(WASM_OBJ_DIR)/sound_data.o: $(DATA_ASM_SUBDIR)/sound_data.s tools/wasm_sound_data.py $(WASM_SAMPLE_BINS) | generated
+	@mkdir -p $(dir $@) $(WASM_BUILD_DIR)
+	uv run python tools/wasm_sound_data.py $< $(WASM_BUILD_DIR)/sound_data.wasm.s
+	$(WASM_CC) --target=wasm32-unknown-unknown -I . -I sound -c $(WASM_BUILD_DIR)/sound_data.wasm.s -o $@
+
+# Each song: mid2agb (.mid -> .s via audio_rules.mk) -> translate -> wasm object.
+$(WASM_OBJ_DIR)/songs/%.o: $(MID_SUBDIR)/%.s tools/wasm_sound_data.py | generated
+	@mkdir -p $(dir $@) $(WASM_BUILD_DIR)/songs
+	uv run python tools/wasm_sound_data.py $< $(WASM_BUILD_DIR)/songs/$*.wasm.s
+	$(WASM_CC) --target=wasm32-unknown-unknown -I . -I sound -c $(WASM_BUILD_DIR)/songs/$*.wasm.s -o $@
 
 $(WASM_OBJ_DIR)/%.o: $(C_SUBDIR)/%.c
 	@mkdir -p $(dir $@)
@@ -266,7 +296,7 @@ $(WASM_OBJ_DIR)/%.o: $(C_SUBDIR)/%.c
 $(WASM_OBJ_DIR)/%.o: $(DATA_ASM_SUBDIR)/%.s tools/wasm_asm_data.py | generated
 	@mkdir -p $(dir $@) $(WASM_BUILD_DIR)
 	uv run python tools/wasm_asm_data.py $< $(WASM_BUILD_DIR)/$*.wasm.s
-	$(WASM_CC) --target=wasm32-unknown-unknown -c $(WASM_BUILD_DIR)/$*.wasm.s -o $@
+	uv run python tools/wasm_asm_compile.py $(WASM_BUILD_DIR)/$*.wasm.s $@
 
 clean-wasm:
 	rm -rf $(WASM_BUILD_DIR)

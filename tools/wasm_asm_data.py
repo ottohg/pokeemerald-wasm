@@ -1126,6 +1126,12 @@ def convert(text: str, source: Optional[Path] = None, emit_sizes: bool = True) -
         "LOCALID_PLAYER": 255,
         "LOCALID_NONE": 0,
         "MOVEMENT_ACTION_STEP_END": 0xFE,
+        # String variable indices (used as sentinels in stringvar/frontier macros)
+        "STR_VAR_1": 0,
+        "STR_VAR_2": 1,
+        "STR_VAR_3": 2,
+        # RGB_BLACK = RGB(0,0,0) = 0; expand this common constant directly
+        "RGB_BLACK": 0,
     })
     counters = {"npcs": 0, "warps": 0, "traps": 0, "signs": 0}
     open_label = None
@@ -1179,11 +1185,23 @@ def convert(text: str, source: Optional[Path] = None, emit_sizes: bool = True) -
         if stripped.startswith(".macro "):
             skip_macro = 1
             continue
+        if stripped.startswith("enum_start ") or stripped == "enum_start":
+            base = stripped[len("enum_start"):].strip()
+            val = eval_asm_expr(base, constants) if base else 0
+            counters["__enum__"] = val if val is not None else 0
+            continue
+        if stripped.startswith("enum "):
+            # Use raw (pre-comment-strip) to capture all semicolon-separated names
+            for part in raw.strip().split(";"):
+                part = part.strip()
+                if part.startswith("enum "):
+                    name = part[len("enum "):].strip()
+                    if re.fullmatch(r"[A-Za-z_]\w*", name):
+                        constants[name] = counters.get("__enum__", 0)
+                        counters["__enum__"] = counters.get("__enum__", 0) + 1
+            continue
         if (
-            stripped.startswith("enum_start ")
-            or stripped == "enum_start"
-            or stripped.startswith("enum ")
-            or stripped.startswith("create_movement_action ")
+            stripped.startswith("create_movement_action ")
             or stripped in {"reset_map_events", "inc _num_npcs", "inc _num_warps", "inc _num_traps", "inc _num_signs"}
         ):
             continue
