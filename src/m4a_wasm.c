@@ -717,6 +717,7 @@ void MPlayMain(struct MusicPlayerInfo *mplayInfo)
 static s32 sMixL[MIX_MAX_SAMPLES];
 static s32 sMixR[MIX_MAX_SAMPLES];
 static u32 sCgbPhase[4] = {0, 0, 0, 0};
+static u16 sNoiseLfsr = 0x7FFF; // CGB channel 4 shift register state
 
 static inline s8 ClampS8(s32 v)
 {
@@ -1026,6 +1027,57 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
                     }
                     sCgbPhase[2] = phase;
                 }
+            }
+        }
+
+        // Channel 4: noise (LFSR). ch->frequency holds the NR43 register value
+        // (bits 7-4 = shift clock s, bits 2-0 = divisor code r); the counter
+        // width (15- vs 7-bit) comes from wavePointer&1 (written to NR43 bit 3).
+        {
+            struct CgbChannel *ch = &cgbChans[3];
+            if (ch->statusFlags & SOUND_CHANNEL_SF_ON)
+            {
+                u32 nr43 = ch->frequency & 0xFFu;
+                u32 r = nr43 & 7u;
+                u32 s = (nr43 >> 4) & 0xFu;
+                u32 width = (u32)(uintptr_t)ch->wavePointer & 1u; // 1 => 7-bit
+
+                // LFSR shift-clock frequency in Hz:
+                //   f = 524288 / r / 2^(s+1)   (r == 0 means r = 0.5)
+                u32 clockHz = (r == 0) ? (524288u >> s) : ((524288u / r) >> (s + 1));
+                if (clockHz == 0) clockHz = 1;
+
+                // .16 fixed-point LFSR steps per output sample.
+                u32 inc = (u32)(((u64)clockHz << 16) / pcmHz);
+                if (inc == 0) inc = 1;
+
+                s32 amp = ((s32)ch->envelopeVolume * 8 * masterAdj) >> 4;
+                s32 ampR = (ch->pan & 0x0Fu) ? amp : 0;
+                s32 ampL = (ch->pan & 0xF0u) ? amp : 0;
+
+                u32 phase = sCgbPhase[3];
+                u16 lfsr = sNoiseLfsr;
+                for (s32 i = 0; i < numSamples; i++)
+                {
+                    // Output is the inverted low bit: bit0==0 -> high level.
+                    s32 hi = (lfsr & 1u) ? -1 : 1;
+                    sMixL[i] += hi * ampL;
+                    sMixR[i] += hi * ampR;
+
+                    phase += inc;
+                    u32 steps = phase >> 16;
+                    phase &= 0xFFFFu;
+                    while (steps--)
+                    {
+                        u32 fb = (lfsr ^ (lfsr >> 1)) & 1u;
+                        lfsr >>= 1;
+                        lfsr |= fb << 14;
+                        if (width)
+                            lfsr = (lfsr & ~0x40u) | (fb << 6); // 7-bit mode
+                    }
+                }
+                sCgbPhase[3] = phase;
+                sNoiseLfsr = lfsr ? lfsr : 0x7FFF; // never let it lock at 0
             }
         }
     }
