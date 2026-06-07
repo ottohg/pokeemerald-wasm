@@ -91,15 +91,14 @@ function feedAudio() {
   if (srcRate <= 0) return;
 
   const dstRate = audioCtx.sampleRate;
-  const bufBase = base + SI_PCM_BUFFER;
 
-  // Read s8 → float32
-  const rawL = new Float32Array(n);
-  const rawR = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    rawL[i] = s8[bufBase + i] / 128.0;
-    rawR[i] = s8[bufBase + PCM_DMA_BUF_SIZE + i] / 128.0;
-  }
+  // Read from the float32 buffers (gWasmPcmL/R) written by WasmSoundMainRAM.
+  // These carry the same ±1.0 range as the s8 pcmBuffer but without 8-bit
+  // quantisation truncation, eliminating the hiss noise floor.
+  const floatPtrL = instance.exports.gWasmPcmL.value;
+  const floatPtrR = instance.exports.gWasmPcmR.value;
+  const rawL = new Float32Array(memory.buffer, floatPtrL, n);
+  const rawR = new Float32Array(memory.buffer, floatPtrR, n);
 
   // Linear-interpolation resample from srcRate to dstRate
   const outLen = Math.round(n * dstRate / srcRate);

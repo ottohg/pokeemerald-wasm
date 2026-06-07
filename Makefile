@@ -281,7 +281,7 @@ $(WASM): Makefile $(WASM_C_OBJS) $(WASM_DATA_OBJS) $(WASM_SOUND_OBJS)
 	$(WASM_LD) --no-entry --allow-undefined --initial-memory=268435456 --max-memory=268435456 \
 		--export=AgbMain --export=WasmRunFrame \
 		--export=gSaveBlock1Ptr --export=gPlayerAvatar --export=gObjectEvents --export=VarGet \
-		--export=gSoundInfo \
+		--export=gSoundInfo --export=gWasmPcmL --export=gWasmPcmR \
 		-o $@ $(filter %.o,$^)
 
 # m4a sound tables / voicegroups / samples (data/sound_data.s) -> wasm object.

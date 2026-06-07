@@ -740,6 +740,12 @@ void MPlayMain(struct MusicPlayerInfo *mplayInfo)
 
 static s32 sMixL[MIX_MAX_SAMPLES];
 static s32 sMixR[MIX_MAX_SAMPLES];
+
+// Float32 output buffers exported to JS. These hold the same frame as
+// pcmBuffer but without the s8 quantisation step, eliminating the
+// 8-bit noise floor (~48 dB) that is audible as background hiss.
+float gWasmPcmL[MIX_MAX_SAMPLES];
+float gWasmPcmR[MIX_MAX_SAMPLES];
 static u32 sCgbPhase[4] = {0, 0, 0, 0};
 static u16 sNoiseLfsr = 0x7FFF; // CGB channel 4 shift register state
 
@@ -1335,12 +1341,25 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
         }
     }
 
-    // Write the mixed frame as signed 8-bit PCM: left then right halves.
+    // Write the mixed frame.
+    // pcmBuffer (s8) is kept for the reverb seed read at the start of the
+    // next frame — it must stay s8 so the reverb arithmetic is unchanged.
+    // gWasmPcmL/R are the float32 copies read by JS: same clamp range
+    // (±127/128 ≈ ±1.0) but without integer truncation, so the 8-bit
+    // quantisation noise floor is eliminated from the browser output.
     s8 *pcm = soundInfo->pcmBuffer;
     for (s32 i = 0; i < numSamples; i++)
     {
-        pcm[i] = ClampS8(sMixL[i]);
-        pcm[PCM_DMA_BUF_SIZE + i] = ClampS8(sMixR[i]);
+        s32 l = sMixL[i];
+        s32 r = sMixR[i];
+        if (l >  127) l =  127;
+        if (l < -128) l = -128;
+        if (r >  127) r =  127;
+        if (r < -128) r = -128;
+        pcm[i]                   = (s8)l;
+        pcm[PCM_DMA_BUF_SIZE + i] = (s8)r;
+        gWasmPcmL[i] = (float)l * (1.0f / 128.0f);
+        gWasmPcmR[i] = (float)r * (1.0f / 128.0f);
     }
 }
 
