@@ -726,6 +726,126 @@ static inline s8 ClampS8(s32 v)
     return (s8)v;
 }
 
+// ---------------------------------------------------------------------------
+// BDPCM (compressed) + reversed sample playback.
+//
+// Compressed waves store 64 samples per 33-byte block: 1 absolute base byte
+// followed by 32 bytes of two 4-bit deltas each (high nibble first), indexed
+// through gDeltaEncodingTable. The first byte after the base contributes only
+// its low nibble (its high nibble is padding), matching SoundMainRAM_Unk2.
+// chan->xpi caches the currently decoded block index into the shared buffer.
+// ---------------------------------------------------------------------------
+
+extern const s8 gDeltaEncodingTable[];
+
+static s8 sDpcmBuf[64];
+
+static s32 DpcmSampleAt(struct SoundChannel *chan, struct WaveData *wav, s32 idx)
+{
+    u32 blk = (u32)idx >> 6;
+    if (blk != chan->xpi)
+    {
+        chan->xpi = blk;
+        const u8 *src = (const u8 *)wav->data + blk * 0x21u;
+        s32 acc = (s8)src[0];
+        sDpcmBuf[0] = (s8)acc;
+        acc += gDeltaEncodingTable[src[1] & 0xF];
+        sDpcmBuf[1] = (s8)acc;
+        s32 n = 2;
+        const u8 *p = src + 2;
+        while (n < 64)
+        {
+            u32 b = *p++;
+            acc += gDeltaEncodingTable[b >> 4];
+            sDpcmBuf[n++] = (s8)acc;
+            if (n >= 64)
+                break;
+            acc += gDeltaEncodingTable[b & 0xF];
+            sDpcmBuf[n++] = (s8)acc;
+        }
+    }
+    return sDpcmBuf[idx & 0x3F];
+}
+
+static void MixCompressedOrReversed(struct SoundChannel *chan, struct WaveData *wav,
+                                    s32 numSamples, u32 divFreq, s32 envL, s32 envR, u8 flags)
+{
+    s32 isCmp = chan->type & TONEDATA_TYPE_CMP;
+    s32 isRev = chan->type & TONEDATA_TYPE_REV;
+    s32 size = (s32)wav->size;
+    s32 count = chan->count;
+    s32 loopFlag = flags & SOUND_CHANNEL_SF_LOOP;
+    s32 loopLen = size - (s32)wav->loopStart;
+
+    // The hardware shares one decode buffer across channels, so the cached
+    // block must be invalidated whenever this channel takes over the buffer.
+    if (isCmp)
+        chan->xpi = 0xFFFF;
+
+    u32 fw = chan->fw;
+    u32 inc = (chan->type & TONEDATA_TYPE_FIX) ? 0x800000u : divFreq * chan->frequency;
+    s32 stopped = 0;
+
+    for (s32 i = 0; i < numSamples; i++)
+    {
+        if (count <= 0)
+        {
+            if (loopFlag)
+            {
+                count += loopLen;
+                if (count <= 0)
+                {
+                    stopped = 1;
+                    break;
+                }
+            }
+            else
+            {
+                stopped = 1;
+                break;
+            }
+        }
+
+        // pos = samples consumed; reversed playback reads from the tail back.
+        s32 pos = size - count;
+        s32 idx0 = isRev ? (size - 1 - pos) : pos;
+        if (idx0 < 0) idx0 = 0;
+        else if (idx0 >= size) idx0 = size - 1;
+        s32 nidx = isRev ? (idx0 - 1) : (idx0 + 1);
+        if (nidx < 0) nidx = 0;
+        else if (nidx >= size) nidx = size - 1;
+
+        s32 s0, s1;
+        if (isCmp)
+        {
+            s0 = DpcmSampleAt(chan, wav, idx0);
+            s1 = (count > 1) ? DpcmSampleAt(chan, wav, nidx) : s0;
+        }
+        else
+        {
+            s0 = wav->data[idx0];
+            s1 = (count > 1) ? wav->data[nidx] : s0;
+        }
+
+        s32 interp = s0 + (((s32)fw * (s1 - s0)) >> 23);
+        sMixL[i] += (interp * envL) >> 8;
+        sMixR[i] += (interp * envR) >> 8;
+
+        fw += inc;
+        u32 step = fw >> 23;
+        if (step != 0)
+        {
+            fw &= 0x7FFFFF;
+            count -= step;
+        }
+    }
+
+    chan->fw = fw;
+    chan->count = count;
+    if (stopped)
+        chan->statusFlags = 0;
+}
+
 static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
 {
     s32 numSamples = soundInfo->pcmSamplesPerVBlank;
@@ -858,14 +978,15 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
         flags = chan->statusFlags;
 
         // --- mixing ---------------------------------------------------------
+        s32 envR = chan->envelopeVolumeRight;
+        s32 envL = chan->envelopeVolumeLeft;
+
         if (chan->type & (TONEDATA_TYPE_CMP | TONEDATA_TYPE_REV))
         {
-            // Compressed / reversed samples are not decoded yet; advance nothing.
+            MixCompressedOrReversed(chan, wav, numSamples, divFreq, envL, envR, flags);
             continue;
         }
 
-        s32 envR = chan->envelopeVolumeRight;
-        s32 envL = chan->envelopeVolumeLeft;
         s8 *ptr = chan->currentPointer;
         s32 count = chan->count;
 
