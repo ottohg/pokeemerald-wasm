@@ -225,8 +225,11 @@ WASM_DATA_OBJS := $(patsubst $(DATA_ASM_SUBDIR)/%.s,$(WASM_OBJ_DIR)/%.o,$(WASM_D
 # for fast iteration; set WASM_SONG_NAMES=all to build every song in midi.cfg.
 WASM_SONG_NAMES ?= mus_dummy mus_intro mus_title mus_littleroot mus_route101 \
 	mus_obtain_item mus_level_up
+# Note: MID_SRCS is defined later in this file, so expand the glob directly here.
+# Use override so a command-line "WASM_SONG_NAMES=all" is replaced by the list
+# (command-line assignments otherwise take precedence over plain := in the file).
 ifeq ($(WASM_SONG_NAMES),all)
-WASM_SONG_NAMES := $(basename $(notdir $(MID_SRCS)))
+override WASM_SONG_NAMES := $(basename $(notdir $(wildcard $(MID_SUBDIR)/*.mid)))
 endif
 WASM_SONG_OBJS := $(patsubst %,$(WASM_OBJ_DIR)/songs/%.o,$(WASM_SONG_NAMES))
 
