@@ -221,10 +221,10 @@ WASM_DATA_ASM_SRCS := \
 WASM_DATA_OBJS := $(patsubst $(DATA_ASM_SUBDIR)/%.s,$(WASM_OBJ_DIR)/%.o,$(WASM_DATA_ASM_SRCS))
 
 # --- WASM audio ---
-# Songs (m4a sequences) to link into the wasm build. Defaults to a small slice
-# for fast iteration; set WASM_SONG_NAMES=all to build every song in midi.cfg.
-WASM_SONG_NAMES ?= mus_dummy mus_intro mus_title mus_littleroot mus_route101 \
-	mus_obtain_item mus_level_up
+# Songs (m4a sequences) to link into the wasm build. Defaults to "all" so the
+# shipped game has its full music + sound effects; set e.g.
+# WASM_SONG_NAMES="mus_title mus_littleroot" for a smaller, faster dev build.
+WASM_SONG_NAMES ?= all
 # Note: MID_SRCS is defined later in this file, so expand the glob directly here.
 # Use override so a command-line "WASM_SONG_NAMES=all" is replaced by the list
 # (command-line assignments otherwise take precedence over plain := in the file).
