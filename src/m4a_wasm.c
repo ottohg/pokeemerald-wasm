@@ -946,6 +946,18 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
             // played their sample once and fell silent instead of looping.
             if (((u8 *)wav)[3] & WAVE_DATA_FLAG_LOOP)
                 flags |= SOUND_CHANNEL_SF_LOOP;
+            // The original SoundMainRAM applies the attack step on the very same
+            // frame as SF_START (falls through from the start setup to _081DCFF8),
+            // so the first audible frame has env = attack, not 0.
+            {
+                s32 a = (s32)chan->attack;
+                if (a >= 0xFF)
+                {
+                    a = 0xFF;
+                    flags = (flags & ~SOUND_CHANNEL_SF_ENV) | SOUND_CHANNEL_SF_ENV_DECAY;
+                }
+                env = (u8)a;
+            }
             chan->statusFlags = flags;
         }
         else
