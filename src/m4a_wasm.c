@@ -337,7 +337,12 @@ void ply_note(u32 noteCmd, struct MusicPlayerInfo *mplayInfo, struct MusicPlayer
         }
     }
 
-    s32 keyForFreq = (tone->type & (TONEDATA_TYPE_RHY | TONEDATA_TYPE_SPL))
+    // Rhythm sub-voices play at a FIXED pitch stored in toneFinal->key (each
+    // percussion hit has its own root key and ignores the track key). Key-split
+    // melodic instruments select a sample based on the note but still play at
+    // the track pitch — using toneFinal->key (60 for every trumpet sub-voice)
+    // here made all keysplit notes sound like Cn3 regardless of what was played.
+    s32 keyForFreq = (tone->type & TONEDATA_TYPE_RHY)
                          ? toneFinal->key
                          : track->key;
 
