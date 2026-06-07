@@ -719,6 +719,14 @@ static s32 sMixR[MIX_MAX_SAMPLES];
 static u32 sCgbPhase[4] = {0, 0, 0, 0};
 static u16 sNoiseLfsr = 0x7FFF; // CGB channel 4 shift register state
 
+// CGB channel 1 (square + sweep) NR10 sweep-unit state. The GBA performs this
+// in hardware; here it is reproduced in software over the swept frequency.
+static u8  sSweepPrevOn = 0;
+static u8  sSweepMuted = 0;
+static u32 sSweepShadow = 0;  // 11-bit shadow frequency register
+static s32 sSweepTimer = 0;   // ticks until next sweep step
+static s32 sSweepTickAcc = 0; // 128 Hz tick accumulator (scaled by frame rate)
+
 static inline s8 ClampS8(s32 v)
 {
     if (v > 127) return 127;
@@ -1079,6 +1087,11 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
         if (pcmHz == 0) pcmHz = 13379;
         s32 masterAdj = (s32)soundInfo->masterVolume + 1;
 
+        // Capture whether channel 1 was already sounding last frame so a fresh
+        // note (OFF->ON) can re-arm the sweep unit below.
+        s32 sweepWasOn = sSweepPrevOn;
+        sSweepPrevOn = (cgbChans[0].statusFlags & SOUND_CHANNEL_SF_ON) != 0;
+
         // Channels 1 and 2: square wave
         for (s32 ci = 0; ci < 2; ci++)
         {
@@ -1087,6 +1100,57 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
                 continue;
 
             u32 freqX = ch->frequency & 0x7FFu;
+
+            // Channel 1 frequency sweep (NR10): period=bits6-4, dir=bit3
+            // (1=decrease), shift=bits2-0. Ticks at 128 Hz against a shadow
+            // frequency; an upward overflow past 2047 silences the channel.
+            if (ci == 0)
+            {
+                u32 sw = ch->sweep;
+                u32 period = (sw >> 4) & 7u;
+                u32 negate = (sw >> 3) & 1u;
+                u32 shift  = sw & 7u;
+
+                if (!sweepWasOn) // new note: reload the sweep unit
+                {
+                    sSweepShadow = freqX;
+                    sSweepTimer = period ? (s32)period : 8;
+                    sSweepTickAcc = 0;
+                    sSweepMuted = 0;
+                }
+
+                if (period != 0 && shift != 0 && !sSweepMuted)
+                {
+                    sSweepTickAcc += 12800; // 128 Hz scaled; frame rate ~59.73 Hz
+                    while (sSweepTickAcc >= 5973)
+                    {
+                        sSweepTickAcc -= 5973;
+                        if (--sSweepTimer <= 0)
+                        {
+                            sSweepTimer = (s32)period;
+                            s32 delta = (s32)(sSweepShadow >> shift);
+                            s32 nf = negate ? (s32)sSweepShadow - delta
+                                            : (s32)sSweepShadow + delta;
+                            if (nf > 2047) { sSweepMuted = 1; break; }
+                            if (nf < 0) nf = 0;
+                            sSweepShadow = (u32)nf;
+                        }
+                    }
+                    if (sSweepMuted)
+                        continue;
+                    freqX = sSweepShadow & 0x7FFu;
+                }
+                else if (period == 0)
+                {
+                    // Sweep idle: track the engine frequency so pitch bends work.
+                    sSweepShadow = freqX;
+                }
+                else
+                {
+                    freqX = sSweepShadow & 0x7FFu;
+                }
+            }
+
             s32 p2048 = 2048 - (s32)freqX;
             if (p2048 <= 0)
                 continue;
