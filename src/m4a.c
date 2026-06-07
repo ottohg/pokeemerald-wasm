@@ -2,6 +2,7 @@
 #include "gba/m4a_internal.h"
 #include "constants/songs.h"
 
+
 extern const u8 gCgb3Vol[];
 
 #define BSS_CODE __attribute__((section(".bss.code")))
@@ -490,11 +491,13 @@ void SampleFreqSet(u32 freq)
 
     m4aSoundVSyncOn();
 
+#if !WASM
     while (*(vu8 *)REG_ADDR_VCOUNT == 159)
         ;
 
     while (*(vu8 *)REG_ADDR_VCOUNT != 159)
         ;
+#endif
 
     REG_TM0CNT_H = TIMER_ENABLE | TIMER_1CLK;
 }

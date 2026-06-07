@@ -421,6 +421,8 @@ void ply_note(u32 noteCmd, struct MusicPlayerInfo *mplayInfo, struct MusicPlayer
     TrkVolPitSet(mplayInfo, track);
 
     chan->gateTime = track->gateTime;
+    chan->midiKey = track->key;
+    chan->velocity = track->velocity;
     chan->priority = priority;
     chan->key = keyForFreq;
     chan->rhythmPan = rhythmPan;
@@ -441,10 +443,8 @@ void ply_note(u32 noteCmd, struct MusicPlayerInfo *mplayInfo, struct MusicPlayer
 
     if (cgbType != 0)
     {
-        // CGB channels are not synthesised yet; mark the slot started so the
-        // sequencer state stays consistent, but it stays silent.
         chan->count = 0;
-        chan->frequency = 0;
+        chan->frequency = soundInfo->MidiKeyToCgbFreq((u8)cgbType, (u8)midiKey, track->pitM);
     }
     else
     {
@@ -696,6 +696,8 @@ void MPlayMain(struct MusicPlayerInfo *mplayInfo)
                         midiKey = 0;
                     if (cgbType == 0)
                         chan->frequency = MidiKeyToFreq(chan->wav, midiKey, track->pitM);
+                    else
+                        chan->frequency = soundInfo->MidiKeyToCgbFreq((u8)cgbType, (u8)midiKey, track->pitM);
                 }
             }
             chan = next;
@@ -714,6 +716,7 @@ void MPlayMain(struct MusicPlayerInfo *mplayInfo)
 
 static s32 sMixL[MIX_MAX_SAMPLES];
 static s32 sMixR[MIX_MAX_SAMPLES];
+static u32 sCgbPhase[4] = {0, 0, 0, 0};
 
 static inline s8 ClampS8(s32 v)
 {
@@ -728,10 +731,25 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
     if (numSamples > MIX_MAX_SAMPLES)
         numSamples = MIX_MAX_SAMPLES;
 
-    for (s32 i = 0; i < numSamples; i++)
+    // Reverb: seed the mix buffer from the previous frame's output scaled by reverb factor.
+    // Without this, notes cut off abruptly and the music sounds dry.
+    u8 reverb = soundInfo->reverb;
+    if (reverb > 0)
     {
-        sMixL[i] = 0;
-        sMixR[i] = 0;
+        s8 *pcmPrev = soundInfo->pcmBuffer;
+        for (s32 i = 0; i < numSamples; i++)
+        {
+            sMixL[i] = ((s32)pcmPrev[i] * reverb) >> 8;
+            sMixR[i] = ((s32)pcmPrev[PCM_DMA_BUF_SIZE + i] * reverb) >> 8;
+        }
+    }
+    else
+    {
+        for (s32 i = 0; i < numSamples; i++)
+        {
+            sMixL[i] = 0;
+            sMixR[i] = 0;
+        }
     }
 
     u32 divFreq = soundInfo->divFreq;
@@ -925,6 +943,91 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
 
         chan->count = count;
         chan->currentPointer = ptr;
+    }
+
+    // ----- CGB channel software synthesis -----
+    // Duty-cycle high-time thresholds in .23 fixed point (fraction of period = "high"):
+    // 0=12.5%, 1=25%, 2=50%, 3=75%
+    static const u32 cgbDutyThresh[4] = {1048576u, 2097152u, 4194304u, 6291456u};
+
+    struct CgbChannel *cgbChans = soundInfo->cgbChans;
+    if (cgbChans != NULL)
+    {
+        u32 pcmHz = (u32)soundInfo->pcmFreq;
+        if (pcmHz == 0) pcmHz = 13379;
+        s32 masterAdj = (s32)soundInfo->masterVolume + 1;
+
+        // Channels 1 and 2: square wave
+        for (s32 ci = 0; ci < 2; ci++)
+        {
+            struct CgbChannel *ch = &cgbChans[ci];
+            if (!(ch->statusFlags & SOUND_CHANNEL_SF_ON))
+                continue;
+
+            u32 freqX = ch->frequency & 0x7FFu;
+            s32 p2048 = 2048 - (s32)freqX;
+            if (p2048 <= 0)
+                continue;
+
+            // inc = 131072 * 2^23 / (pcmHz * p2048)  [.23 fixed-point phase step]
+            u32 inc = (u32)((131072ULL << 23) / ((u64)pcmHz * (u64)p2048));
+            if (inc == 0) inc = 1;
+
+            u32 duty = (u32)(uintptr_t)ch->wavePointer;
+            if (duty > 3u) duty = 2u;
+            u32 thresh = cgbDutyThresh[duty];
+
+            s32 amp = ((s32)ch->envelopeVolume * 8 * masterAdj) >> 4;
+            s32 ampR = (ch->pan & 0x0Fu) ? amp : 0;
+            s32 ampL = (ch->pan & 0xF0u) ? amp : 0;
+
+            u32 phase = sCgbPhase[ci];
+            for (s32 i = 0; i < numSamples; i++)
+            {
+                s32 hi = (phase < thresh) ? 1 : -1;
+                sMixL[i] += hi * ampL;
+                sMixR[i] += hi * ampR;
+                phase = (phase + inc) & 0x7FFFFFu;
+            }
+            sCgbPhase[ci] = phase;
+        }
+
+        // Channel 3: wave table (32 nibble samples, freq = 65536 / (2048 - X) Hz)
+        {
+            struct CgbChannel *ch = &cgbChans[2];
+            if ((ch->statusFlags & SOUND_CHANNEL_SF_ON) && ch->wavePointer != NULL)
+            {
+                u32 freqX = ch->frequency & 0x7FFu;
+                s32 p2048 = 2048 - (s32)freqX;
+                if (p2048 > 0)
+                {
+                    // phase in [0, 2^29) covers 32 samples at .24 frac
+                    // inc = 2^45 / (pcmHz * p2048)
+                    u32 inc = (u32)((1ULL << 45) / ((u64)pcmHz * (u64)p2048));
+                    if (inc == 0) inc = 1;
+
+                    s32 amp = ((s32)ch->envelopeVolume * 8 * masterAdj) >> 4;
+                    s32 ampR = (ch->pan & 0x0Fu) ? amp : 0;
+                    s32 ampL = (ch->pan & 0xF0u) ? amp : 0;
+
+                    u8 *waveBytes = (u8 *)ch->wavePointer;
+                    u32 phase = sCgbPhase[2];
+                    for (s32 i = 0; i < numSamples; i++)
+                    {
+                        u32 sIdx = phase >> 24; // 0-31
+                        u8 bval = waveBytes[sIdx >> 1];
+                        // GBA plays high nibble first (MSB→LSB per byte)
+                        s32 nib = (sIdx & 1u) ? (s32)(bval & 0x0Fu) : (s32)(bval >> 4);
+                        s32 sample = nib - 8; // centre at 0, range -8..7
+                        // Divide by 8 to normalize: wave table range is ±8, not ±1 like square wave
+                        sMixL[i] += (sample * ampL) >> 3;
+                        sMixR[i] += (sample * ampR) >> 3;
+                        phase = (phase + inc) & 0x1FFFFFFFu;
+                    }
+                    sCgbPhase[2] = phase;
+                }
+            }
+        }
     }
 
     // Write the mixed frame as signed 8-bit PCM: left then right halves.

@@ -275,7 +275,11 @@ $(WASM_C_OBJS): | generated wasm-assets
 
 $(WASM): Makefile $(WASM_C_OBJS) $(WASM_DATA_OBJS) $(WASM_SOUND_OBJS)
 	@test -n "$(WASM_LD)" || { echo "wasm-ld not found; set WASM_LD=/path/to/wasm-ld"; exit 1; }
-	$(WASM_LD) --no-entry --allow-undefined --initial-memory=268435456 --max-memory=268435456 --export=AgbMain --export=WasmRunFrame --export-all -o $@ $(filter %.o,$^)
+	$(WASM_LD) --no-entry --allow-undefined --initial-memory=268435456 --max-memory=268435456 \
+		--export=AgbMain --export=WasmRunFrame \
+		--export=gSaveBlock1Ptr --export=gPlayerAvatar --export=gObjectEvents --export=VarGet \
+		--export=gSoundInfo \
+		-o $@ $(filter %.o,$^)
 
 # m4a sound tables / voicegroups / samples (data/sound_data.s) -> wasm object.
 $(WASM_OBJ_DIR)/sound_data.o: $(DATA_ASM_SUBDIR)/sound_data.s tools/wasm_sound_data.py $(WASM_SAMPLE_BINS) | generated

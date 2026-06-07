@@ -39,6 +39,85 @@ const keyMap = new Map([
   ['KeyS', 'r'], ['KeyA', 'l'],
 ]);
 
+// SoundInfo layout offsets (see include/gba/m4a_internal.h)
+const SI_PCM_SAMPLES = 16; // s32 pcmSamplesPerVBlank
+const SI_PCM_FREQ    = 20; // s32 pcmFreq (actual sample rate in Hz)
+const SI_PCM_BUFFER  = 848; // s8 pcmBuffer[3168]  left:[0..n) right:[1584..1584+n)
+const PCM_DMA_BUF_SIZE = 1584;
+
+let audioCtx;
+let audioNode;
+let audioReady = false;
+
+async function initAudio() {
+  if (audioReady) return;
+  audioReady = true;
+  audioCtx = new AudioContext();
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+  await audioCtx.audioWorklet.addModule('/web/audio-worklet.js');
+  audioNode = new AudioWorkletNode(audioCtx, 'pokeemerald-audio', {
+    outputChannelCount: [2],
+  });
+  audioNode.connect(audioCtx.destination);
+  console.log('[audio] ready, sampleRate=', audioCtx.sampleRate);
+}
+
+function feedAudio() {
+  if (!audioNode || !instance) return;
+  const base = instance.exports.gSoundInfo.value;
+  const n = readS32(base + SI_PCM_SAMPLES);
+  const srcRate = readS32(base + SI_PCM_FREQ);
+  feedAudio._frame = (feedAudio._frame || 0) + 1;
+  if (feedAudio._frame % 300 === 1) {
+    let maxAbs = 0;
+    for (let i = 0; i < n; i++) maxAbs = Math.max(maxAbs, Math.abs(s8[base + SI_PCM_BUFFER + i]));
+    const maxChans = u8[base + 6];
+    let dsTypes = '', cgbInfo = '';
+    for (let ci = 0; ci < maxChans; ci++) {
+      const cb = base + 80 + ci * 64;
+      if (u8[cb] & 0xC7) {
+        const t = u8[cb + 1];
+        dsTypes += (t & 7 ? 'CGB' : t & 0x20 ? 'CMP' : t & 8 ? 'FIX' : 'PCM') + ' ';
+      }
+    }
+    const cgbPtr = readU32(base + 28);
+    if (cgbPtr) for (let ci = 0; ci < 3; ci++) {
+      const cb = cgbPtr + ci * 64;
+      if (u8[cb] & 0xC7) cgbInfo += `ch${ci+1}(ev=${u8[cb+9]} pan=${u8[cb+27].toString(16)} f=${readU32(cb+32)&0x7ff}) `;
+    }
+    console.log(`[audio] f=${feedAudio._frame} maxAbs=${maxAbs} DS:[${dsTypes}] CGB:[${cgbInfo || 'none'}]`);
+  }
+  if (n <= 0 || n > PCM_DMA_BUF_SIZE) return;
+  if (srcRate <= 0) return;
+
+  const dstRate = audioCtx.sampleRate;
+  const bufBase = base + SI_PCM_BUFFER;
+
+  // Read s8 → float32
+  const rawL = new Float32Array(n);
+  const rawR = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    rawL[i] = s8[bufBase + i] / 128.0;
+    rawR[i] = s8[bufBase + PCM_DMA_BUF_SIZE + i] / 128.0;
+  }
+
+  // Linear-interpolation resample from srcRate to dstRate
+  const outLen = Math.round(n * dstRate / srcRate);
+  const L = new Float32Array(outLen);
+  const R = new Float32Array(outLen);
+  const step = (n - 1) / Math.max(outLen - 1, 1);
+  for (let i = 0; i < outLen; i++) {
+    const si = i * step;
+    const lo = Math.floor(si);
+    const hi = Math.min(lo + 1, n - 1);
+    const t = si - lo;
+    L[i] = rawL[lo] + t * (rawL[hi] - rawL[lo]);
+    R[i] = rawR[lo] + t * (rawR[hi] - rawR[lo]);
+  }
+
+  audioNode.port.postMessage({ L, R }, [L.buffer, R.buffer]);
+}
+
 const canvas = document.querySelector('#screen');
 const statusEl = document.querySelector('#status');
 const speedInput = document.querySelector('#speed');
@@ -53,6 +132,7 @@ let instance;
 let memory;
 let u8;
 let u16;
+let s8;
 let statusText = 'loading wasm…';
 let lastFpsUpdate = performance.now();
 let lastTick = performance.now();
@@ -72,6 +152,7 @@ if (automate) {
 function refreshViews() {
   u8 = new Uint8Array(memory.buffer);
   u16 = new Uint16Array(memory.buffer);
+  s8 = new Int8Array(memory.buffer);
 }
 
 function bytesToBase64(bytes) {
@@ -647,7 +728,7 @@ function importsFor(module) {
         case 'Div': return args[1] ? (args[0] / args[1]) | 0 : 0;
         case 'Sqrt': return Math.sqrt(args[0]) | 0;
         case 'strcmp': return readCString(args[0]).localeCompare(readCString(args[1]));
-        default: return 0;
+default: return 0;
       }
     };
   }
@@ -683,6 +764,7 @@ window.addEventListener('keydown', (event) => {
   const name = keyMap.get(event.code);
   if (!name) return;
   event.preventDefault();
+  initAudio();
   setPressed(name, true);
 });
 
@@ -701,7 +783,7 @@ window.addEventListener('visibilitychange', () => {
 
 document.querySelectorAll('[data-key]').forEach((button) => {
   const name = button.dataset.key;
-  button.addEventListener('pointerdown', (event) => { event.preventDefault(); setPressed(name, true); });
+  button.addEventListener('pointerdown', (event) => { event.preventDefault(); initAudio(); setPressed(name, true); });
   button.addEventListener('pointerup', () => setPressed(name, false));
   button.addEventListener('pointercancel', () => setPressed(name, false));
   button.addEventListener('pointerleave', () => setPressed(name, false));
@@ -719,8 +801,10 @@ function fpsStatus(displayFps, gameFps) {
 }
 
 async function boot() {
-  const bytes = await fetch('/build/wasm/pokeemerald.wasm', { cache: 'no-store' }).then((res) => res.arrayBuffer());
-  const module = await WebAssembly.compile(bytes);
+  const wasmUrl = '/build/wasm/pokeemerald.wasm';
+  const module = await WebAssembly.compileStreaming(fetch(wasmUrl, { cache: 'no-store' }));
+  const byteLength = await fetch(wasmUrl, { method: 'HEAD', cache: 'no-store' })
+    .then(r => parseInt(r.headers.get('content-length') || '0')).catch(() => 0);
   instance = await WebAssembly.instantiate(module, importsFor(module));
   memory = instance.exports.memory;
   window.pokeemerald = { instance, memory, runFrames };
@@ -729,7 +813,7 @@ async function boot() {
   loadFlashSave();
   writeKeys();
   instance.exports.AgbMain();
-  statusText = `running — ${(bytes.byteLength / 1024 / 1024).toFixed(1)} MiB wasm`;
+  statusText = byteLength ? `running — ${(byteLength / 1024 / 1024).toFixed(1)} MiB wasm` : 'running';
   setSpeedFromExponent(speedToExponent(initialSpeed()));
   statusEl.textContent = fpsStatus(0, 0);
   if (automate) {
@@ -761,6 +845,7 @@ function runFrames(frameCount, keyMask = 0) {
     if (keyMask) u16[KEYINPUT >> 1] = KEY_MASK ^ keyMask;
     else writeKeys();
     instance.exports.WasmRunFrame();
+    feedAudio();
     currentFrame++;
     stepPendingPresses();
   }
