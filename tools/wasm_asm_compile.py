@@ -6,12 +6,41 @@ lines.  This script splits the input at .size boundaries (end of each data
 symbol) into chunks of at most CHUNK_MAX_LINES lines, compiles each chunk
 with clang, and merges the resulting objects with wasm-ld --relocatable.
 """
+import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 CHUNK_MAX_LINES = 6000
+
+# A label definition on its own line, e.g. "LittlerootTown:".
+_LABEL_DEF = re.compile(r"^([A-Za-z_][A-Za-z0-9_.$]*):\s*$")
+
+
+def globalize_labels(content: str) -> str:
+    """Emit a `.globl` for every locally-defined data label.
+
+    The file is split into separately-compiled chunks (see split_chunks) that
+    are merged with `wasm-ld --relocatable`. A symbol that is referenced from a
+    different chunk than the one defining it must be global, otherwise the
+    reference resolves to 0 at merge time. Most generated data labels (e.g. the
+    per-map MapHeader structs `LittlerootTown`, `InsideOfTruck`) are local, so
+    any cross-chunk `.4byte <label>` silently became a null pointer. Promoting
+    every definition to global keeps chunking transparent.
+    """
+    out: list[str] = []
+    already_global: set[str] = set()
+    for line in content.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith(".globl"):
+            already_global.add(stripped.split(None, 1)[1].strip())
+        match = _LABEL_DEF.match(stripped)
+        if match and match.group(1) not in already_global:
+            out.append(f".globl {match.group(1)}\n")
+            already_global.add(match.group(1))
+        out.append(line)
+    return "".join(out)
 
 
 def split_chunks(content: str) -> list[str]:
@@ -40,7 +69,7 @@ def main() -> None:
 
     input_path = Path(sys.argv[1])
     output_path = Path(sys.argv[2])
-    content = input_path.read_text()
+    content = globalize_labels(input_path.read_text())
     chunks = split_chunks(content)
 
     clang = ["clang", "--target=wasm32-unknown-unknown", "-x", "assembler"]
