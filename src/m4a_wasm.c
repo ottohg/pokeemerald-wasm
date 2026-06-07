@@ -741,9 +741,14 @@ void MPlayMain(struct MusicPlayerInfo *mplayInfo)
 static s32 sMixL[MIX_MAX_SAMPLES];
 static s32 sMixR[MIX_MAX_SAMPLES];
 
-// Float32 output buffers exported to JS. These hold the same frame as
-// pcmBuffer but without the s8 quantisation step, eliminating the
-// 8-bit noise floor (~48 dB) that is audible as background hiss.
+// Parallel float accumulators for the JS output path. These accumulate the
+// same mix as sMixL/R but without the integer >> 8 truncation that each
+// channel contribution applies to the s32 path, eliminating the ~-40 dB
+// quantisation noise floor that is audible as background hiss.
+static float sMixLF[MIX_MAX_SAMPLES];
+static float sMixRF[MIX_MAX_SAMPLES];
+
+// Float32 output buffers read by JS via a Float32Array view into WASM memory.
 float gWasmPcmL[MIX_MAX_SAMPLES];
 float gWasmPcmR[MIX_MAX_SAMPLES];
 static u32 sCgbPhase[4] = {0, 0, 0, 0};
@@ -868,6 +873,9 @@ static void MixCompressedOrReversed(struct SoundChannel *chan, struct WaveData *
         s32 interp = s0 + (((s32)fw * (s1 - s0)) >> 23);
         sMixL[i] += (interp * envL) >> 8;
         sMixR[i] += (interp * envR) >> 8;
+        float interpF = (float)s0 + ((float)fw * (float)(s1 - s0)) * (1.0f/8388608.0f);
+        sMixLF[i] += interpF * (float)envL * (1.0f/256.0f);
+        sMixRF[i] += interpF * (float)envR * (1.0f/256.0f);
 
         fw += inc;
         u32 step = fw >> 23;
@@ -903,11 +911,15 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
     if (reverb > 0)
     {
         s8 *pcmPrev = soundInfo->pcmBuffer;
+        float rvScale = (float)reverb * (1.0f / 256.0f);
         for (s32 i = 0; i < numSamples; i++)
         {
             s32 rv = (((s32)pcmPrev[i] + (s32)pcmPrev[PCM_DMA_BUF_SIZE + i]) * (s32)reverb) >> 8;
             sMixL[i] = rv;
             sMixR[i] = rv;
+            float rvf = ((float)pcmPrev[i] + (float)pcmPrev[PCM_DMA_BUF_SIZE + i]) * rvScale;
+            sMixLF[i] = rvf;
+            sMixRF[i] = rvf;
         }
     }
     else
@@ -916,6 +928,8 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
         {
             sMixL[i] = 0;
             sMixR[i] = 0;
+            sMixLF[i] = 0.0f;
+            sMixRF[i] = 0.0f;
         }
     }
 
@@ -1079,6 +1093,9 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
                 count--;
                 sMixL[i] += (s * envL) >> 8;
                 sMixR[i] += (s * envR) >> 8;
+                float sf = (float)s;
+                sMixLF[i] += sf * (float)envL * (1.0f/256.0f);
+                sMixRF[i] += sf * (float)envR * (1.0f/256.0f);
             }
         }
         else
@@ -1111,6 +1128,9 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
                 s32 interp = s0 + (((s32)(fw) * (s1 - s0)) >> 23);
                 sMixL[i] += (interp * envL) >> 8;
                 sMixR[i] += (interp * envR) >> 8;
+                float interpF = (float)s0 + ((float)fw * (float)(s1 - s0)) * (1.0f/8388608.0f);
+                sMixLF[i] += interpF * (float)envL * (1.0f/256.0f);
+                sMixRF[i] += interpF * (float)envR * (1.0f/256.0f);
 
                 fw += inc;
                 u32 step = fw >> 23;
@@ -1224,12 +1244,15 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
             s32 ampR = (ch->pan & 0x0Fu) ? amp : 0;
             s32 ampL = (ch->pan & 0xF0u) ? amp : 0;
 
+            float ampLF = (float)ampL, ampRF = (float)ampR;
             u32 phase = sCgbPhase[ci];
             for (s32 i = 0; i < numSamples; i++)
             {
                 s32 hi = (phase < thresh) ? 1 : -1;
                 sMixL[i] += hi * ampL;
                 sMixR[i] += hi * ampR;
+                sMixLF[i] += (float)hi * ampLF;
+                sMixRF[i] += (float)hi * ampRF;
                 phase = (phase + inc) & 0x7FFFFFu;
             }
             sCgbPhase[ci] = phase;
@@ -1282,6 +1305,9 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
                         // Divide by 8 to normalize: wave table range is ±8, not ±1 like square wave
                         sMixL[i] += (sample * ampL) >> 3;
                         sMixR[i] += (sample * ampR) >> 3;
+                        float sf = (float)sample * (1.0f/8.0f);
+                        sMixLF[i] += sf * (float)ampL;
+                        sMixRF[i] += sf * (float)ampR;
                         phase = (phase + inc) & 0x1FFFFFFFu;
                     }
                     sCgbPhase[2] = phase;
@@ -1322,6 +1348,8 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
                     s32 hi = (lfsr & 1u) ? -1 : 1;
                     sMixL[i] += hi * ampL;
                     sMixR[i] += hi * ampR;
+                    sMixLF[i] += (float)hi * (float)ampL;
+                    sMixRF[i] += (float)hi * (float)ampR;
 
                     phase += inc;
                     u32 steps = phase >> 16;
@@ -1342,11 +1370,10 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
     }
 
     // Write the mixed frame.
-    // pcmBuffer (s8) is kept for the reverb seed read at the start of the
-    // next frame — it must stay s8 so the reverb arithmetic is unchanged.
-    // gWasmPcmL/R are the float32 copies read by JS: same clamp range
-    // (±127/128 ≈ ±1.0) but without integer truncation, so the 8-bit
-    // quantisation noise floor is eliminated from the browser output.
+    // pcmBuffer (s8) uses the s32 path — kept for the reverb seed next frame.
+    // gWasmPcmL/R use the float path (sMixLF/RF) which accumulated the same
+    // contributions without the >> 8 and >> 23 integer truncations, removing
+    // the ~-40 dB quantisation noise floor audible as background hiss.
     s8 *pcm = soundInfo->pcmBuffer;
     for (s32 i = 0; i < numSamples; i++)
     {
@@ -1356,10 +1383,16 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
         if (l < -128) l = -128;
         if (r >  127) r =  127;
         if (r < -128) r = -128;
-        pcm[i]                   = (s8)l;
+        pcm[i]                    = (s8)l;
         pcm[PCM_DMA_BUF_SIZE + i] = (s8)r;
-        gWasmPcmL[i] = (float)l * (1.0f / 128.0f);
-        gWasmPcmR[i] = (float)r * (1.0f / 128.0f);
+        float fl = sMixLF[i] * (1.0f / 128.0f);
+        float fr = sMixRF[i] * (1.0f / 128.0f);
+        if (fl >  1.0f) fl =  1.0f;
+        if (fl < -1.0f) fl = -1.0f;
+        if (fr >  1.0f) fr =  1.0f;
+        if (fr < -1.0f) fr = -1.0f;
+        gWasmPcmL[i] = fl;
+        gWasmPcmR[i] = fr;
     }
 }
 
