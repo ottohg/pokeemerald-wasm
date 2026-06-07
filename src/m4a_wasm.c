@@ -1212,7 +1212,9 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
             if (duty > 3u) duty = 2u;
             u32 thresh = cgbDutyThresh[duty];
 
-            s32 amp = ((s32)ch->envelopeVolume * 8 * masterAdj) >> 4;
+            // CGB envelope is 0-15; scale matches hardware: CGB at env=15 contributes
+            // 15 units to the DAC, the same range as the DS PCM buffer (s8, max 127).
+            s32 amp = ((s32)ch->envelopeVolume * masterAdj) >> 4;
             s32 ampR = (ch->pan & 0x0Fu) ? amp : 0;
             s32 ampL = (ch->pan & 0xF0u) ? amp : 0;
 
@@ -1257,7 +1259,7 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
                     default:   volQuarters = 0; break; // mute (0x00)
                     }
                     // 100% matches a max-volume square channel's peak amplitude.
-                    s32 fullAmp = ((s32)15 * 8 * masterAdj) >> 4;
+                    s32 fullAmp = ((s32)15 * masterAdj) >> 4;
                     s32 amp = (fullAmp * volQuarters) >> 2;
                     s32 ampR = (ch->pan & 0x0Fu) ? amp : 0;
                     s32 ampL = (ch->pan & 0xF0u) ? amp : 0;
@@ -1302,7 +1304,7 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
                 u32 inc = (u32)(((u64)clockHz << 16) / pcmHz);
                 if (inc == 0) inc = 1;
 
-                s32 amp = ((s32)ch->envelopeVolume * 8 * masterAdj) >> 4;
+                s32 amp = ((s32)ch->envelopeVolume * masterAdj) >> 4;
                 s32 ampR = (ch->pan & 0x0Fu) ? amp : 0;
                 s32 ampL = (ch->pan & 0xF0u) ? amp : 0;
 
