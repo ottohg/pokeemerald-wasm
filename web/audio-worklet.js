@@ -35,15 +35,18 @@ class PokeemeraldAudioProcessor extends AudioWorkletProcessor {
     const n = L.length;
 
     const avail = (this._write - this._read) & (RING_SIZE * 2 - 1);
-    if (avail < n) {
-      L.fill(0);
-      R.fill(0);
-    } else {
-      for (let i = 0; i < n; i++) {
-        L[i] = this._L[this._read & RING_MASK];
-        R[i] = this._R[this._read & RING_MASK];
-        this._read = (this._read + 1) & (RING_SIZE * 2 - 1);
-      }
+    // Drain whatever is available. If short, zero-pad only the remainder so
+    // that a brief underrun produces a tiny silent tail rather than a full
+    // block of silence (which sounds like a distinct crack/pop).
+    const toDrain = Math.min(avail, n);
+    for (let i = 0; i < toDrain; i++) {
+      L[i] = this._L[this._read & RING_MASK];
+      R[i] = this._R[this._read & RING_MASK];
+      this._read = (this._read + 1) & (RING_SIZE * 2 - 1);
+    }
+    if (toDrain < n) {
+      L.fill(0, toDrain);
+      R.fill(0, toDrain);
     }
     return true;
   }
