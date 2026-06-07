@@ -21,6 +21,7 @@
 #define WAVE_DATA_FLAG_LOOP       0xC0
 
 extern const u8 gClockTable[];
+extern const u8 gCgb3Vol[];
 extern u32 MidiKeyToFreq(struct WaveData *wav, u8 key, u8 fineAdjust);
 
 // ---------------------------------------------------------------------------
@@ -215,8 +216,11 @@ void ply_tune(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
 
 void ply_port(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track)
 {
-    // Portamento drives the CGB sweep registers on hardware; consume both bytes
-    // and leave PSG output to the (currently silent) CGB path.
+    // This command (jump-table slot 27) is a raw CGB-register poke: byte 0 is an
+    // offset from REG_SOUND1CNT_L and byte 1 the value written there (see ply_port
+    // in m4a_1.s). It is not used by standard song data, and the registers it would
+    // target don't exist under the software-synthesised CGB path here, so we only
+    // consume the two bytes to keep the command stream in sync.
     TrackReadByte(track);
     TrackReadByte(track);
 }
@@ -379,17 +383,24 @@ void ply_note(u32 noteCmd, struct MusicPlayerInfo *mplayInfo, struct MusicPlayer
             }
             if (c->statusFlags & SOUND_CHANNEL_SF_STOP)
             {
+                // Releasing channels are preferred steal targets. The first one
+                // switches the search into "stopping only" mode; subsequent
+                // releasing channels still compete on priority/track below
+                // (matching ply_note in m4a_1.s, which keeps scanning them).
                 if (!stopFound)
                 {
                     stopFound = 1;
                     bestPriority = c->priority;
                     bestTrack = c->track;
                     chan = c;
+                    continue;
                 }
+            }
+            else if (stopFound)
+            {
+                // Once a releasing channel is in hand, never steal a playing one.
                 continue;
             }
-            if (stopFound)
-                continue;
             if (c->priority < bestPriority)
             {
                 bestPriority = c->priority;
@@ -868,16 +879,24 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
     if (numSamples > MIX_MAX_SAMPLES)
         numSamples = MIX_MAX_SAMPLES;
 
-    // Reverb: seed the mix buffer from the previous frame's output scaled by reverb factor.
-    // Without this, notes cut off abruptly and the music sounds dry.
+    // Reverb: seed the mix buffer from the previous frame's output scaled by the
+    // reverb factor. The hardware engine (SoundMainRAM_Reverb in m4a_1.s) sums
+    // four samples - the current buffer's L+R and the alternate DMA buffer's L+R -
+    // multiplies by reverb, shifts right by 9, and writes that single value to
+    // *both* L and R. That mono blend is what gives MP2K reverb its centred,
+    // "wet" tail. There is no DMA double-buffering here, so the just-played frame
+    // stands in for both the current and alternate buffers: cur==other==prev,
+    // which makes the 4-sample sum 2*(prevL+prevR) and the >>9 collapse to
+    // (prevL+prevR)*reverb >> 8, seeded identically into L and R.
     u8 reverb = soundInfo->reverb;
     if (reverb > 0)
     {
         s8 *pcmPrev = soundInfo->pcmBuffer;
         for (s32 i = 0; i < numSamples; i++)
         {
-            sMixL[i] = ((s32)pcmPrev[i] * reverb) >> 8;
-            sMixR[i] = ((s32)pcmPrev[PCM_DMA_BUF_SIZE + i] * reverb) >> 8;
+            s32 rv = (((s32)pcmPrev[i] + (s32)pcmPrev[PCM_DMA_BUF_SIZE + i]) * (s32)reverb) >> 8;
+            sMixL[i] = rv;
+            sMixR[i] = rv;
         }
     }
     else
@@ -915,7 +934,12 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
             chan->count = wav->size - chan->count;
             env = 0;
             chan->fw = 0;
-            if (((u8 *)&wav->type)[1] & WAVE_DATA_FLAG_LOOP)
+            // The loop flag is WaveData byte offset 3 (o_WaveData_flags in
+            // m4a_constants.inc) - the high byte of the u16 `status` field, NOT
+            // byte 1 of `type`. Reading the wrong byte left every looped sample
+            // unflagged, so sustained instruments (e.g. the intro trumpets)
+            // played their sample once and fell silent instead of looping.
+            if (((u8 *)wav)[3] & WAVE_DATA_FLAG_LOOP)
                 flags |= SOUND_CHANNEL_SF_LOOP;
             chan->statusFlags = flags;
         }
@@ -1200,7 +1224,24 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
                     u32 inc = (u32)((1ULL << 45) / ((u64)pcmHz * (u64)p2048));
                     if (inc == 0) inc = 1;
 
-                    s32 amp = ((s32)ch->envelopeVolume * 8 * masterAdj) >> 4;
+                    // The wave channel volume is not the linear 0-15 envelope; the
+                    // engine maps it through gCgb3Vol to one of the hardware NR32
+                    // output levels (mute / 25% / 50% / 75% / 100%, where 75% is the
+                    // GBA-only extension at bit 7). Reproduce that quantisation so
+                    // ch3's loudness curve matches hardware instead of fading
+                    // smoothly across all 16 steps.
+                    s32 volQuarters;
+                    switch (gCgb3Vol[ch->envelopeVolume & 0xF])
+                    {
+                    case 0x20: volQuarters = 4; break; // 100%
+                    case 0x80: volQuarters = 3; break; // 75% (GBA extension)
+                    case 0x40: volQuarters = 2; break; // 50%
+                    case 0x60: volQuarters = 1; break; // 25%
+                    default:   volQuarters = 0; break; // mute (0x00)
+                    }
+                    // 100% matches a max-volume square channel's peak amplitude.
+                    s32 fullAmp = ((s32)15 * 8 * masterAdj) >> 4;
+                    s32 amp = (fullAmp * volQuarters) >> 2;
                     s32 ampR = (ch->pan & 0x0Fu) ? amp : 0;
                     s32 ampL = (ch->pan & 0xF0u) ? amp : 0;
 
