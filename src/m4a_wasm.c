@@ -530,14 +530,22 @@ void MPlayMain(struct MusicPlayerInfo *mplayInfo)
         return;
     mplayInfo->ident++;
 
+    // A negative status means the player is paused (MUSICPLAYER_STATUS_PAUSE,
+    // bit 31): skip all processing. Otherwise always advance any active fade,
+    // and bail out if the fade just completed and paused the player. This
+    // mirrors the original MPlayMain (m4a_1.s); inverting it leaves fades
+    // (FadeOutBGM, title-screen music stop, cutscene transitions) stuck.
     if ((s32)mplayInfo->status < 0)
     {
-        FadeOutBody(mplayInfo);
-        if ((s32)mplayInfo->status < 0)
-        {
-            mplayInfo->ident = ID_NUMBER;
-            return;
-        }
+        mplayInfo->ident = ID_NUMBER;
+        return;
+    }
+
+    FadeOutBody(mplayInfo);
+    if ((s32)mplayInfo->status < 0)
+    {
+        mplayInfo->ident = ID_NUMBER;
+        return;
     }
 
     mplayInfo->tempoC += mplayInfo->tempoI;
