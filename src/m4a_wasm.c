@@ -915,9 +915,21 @@ static void WasmSoundMainRAM(struct SoundInfo *soundInfo)
         for (s32 i = 0; i < numSamples; i++)
         {
             s32 rv = (((s32)pcmPrev[i] + (s32)pcmPrev[PCM_DMA_BUF_SIZE + i]) * (s32)reverb) >> 8;
+            // The reverb writes rv to both L and R, so the per-sample feedback is
+            // self-correlated and its loop gain is reverb/128 -- exactly 1.0 at
+            // the common reverb value 0x80. At unity gain the feedback is only
+            // marginally stable: any residual left in pcmBuffer when the last
+            // channel stops freezes instead of decaying, and that frozen buffer
+            // replays every frame as a faint high-frequency ring (now audible on
+            // the JS float path, which no longer has the s8 hiss floor that used
+            // to mask it). Bleed the feedback strictly toward zero by 1 LSB/frame
+            // so reverb tails always reach true silence. The nudge is within the
+            // s8 DAC's own +-1 noise, so it does not perceptibly alter live tails.
+            if (rv > 0) rv--;
+            else if (rv < 0) rv++;
             sMixL[i] = rv;
             sMixR[i] = rv;
-            float rvf = ((float)pcmPrev[i] + (float)pcmPrev[PCM_DMA_BUF_SIZE + i]) * rvScale;
+            float rvf = (float)rv;
             sMixLF[i] = rvf;
             sMixRF[i] = rvf;
         }
